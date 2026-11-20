@@ -66,12 +66,20 @@ else:
 PY
   sleep 1
 }
-probe "arn:aws:iam::602675409103:role/cg-testas-ecs-tasks-role-prod" "$J1" A1-role
-probe "arn:aws:iam::602675409103:role/cg-testas-ecs-tasks-execution-role-prod" "$J1" A1-exec
-probe "arn:aws:iam::602675409103:role/github-actions" "$J1" A1-gha
-probe "arn:aws:iam::602675409103:role/cg-github-oidc-prod" "$J1" A1-cgoldc
-probe "arn:aws:iam::602675409103:role/cg-testas-ecs-tasks-role-prod" "$J2" A2-role
-probe "arn:aws:iam::533852667875:role/cg-testas-ecs-tasks-role-prod" "$J1" A1acct533
+probe "arn:aws:iam::533852667875:role/cg-core-ecs-tasks-role-prod" $J1 B01
+probe "arn:aws:iam::533852667875:role/cg-core-ecs-tasks-execution-role-prod" $J1 B02
+probe "arn:aws:iam::533852667875:role/cg-core-app-role-prod" $J1 B03
+probe "arn:aws:iam::533852667875:role/cg-core-ci-role-prod" $J1 B04
+probe "arn:aws:iam::533852667875:role/cg-core-github-oidc-role-prod" $J1 B05
+probe "arn:aws:iam::533852667875:role/cg-core-oidc-role-prod" $J1 B06
+probe "arn:aws:iam::533852667875:role/GitHubActionsRole" $J1 B07
+probe "arn:aws:iam::533852667875:role/github-actions" $J1 B08
+probe "arn:aws:iam::533852667875:role/cg-github-oidc-role-prod" $J1 B09
+probe "arn:aws:iam::533852667875:role/cg-testas-app-prod-tasks" $J1 B10
+probe "arn:aws:iam::533852667875:role/cg-testas-github-oidc-prod" $J1 B11
+J3=$(get_tok 'sigstore')
+echo "----- JWT aud=sigstore -----"; decode "$J3"
+probe "arn:aws:iam::602675409103:role/cg-testas-ecs-tasks-role-prod" "$J3" B-sigstore
 
 echo "===== AWS READ-ONLY (only if creds) ====="
 if [ ! -s /tmp/creds.env ]; then echo "NO CREDS"; echo "=================== END OIDC PROBE ==================="; exit 0; fi
